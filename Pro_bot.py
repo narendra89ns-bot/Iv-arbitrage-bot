@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 from aiohttp import web
@@ -14,37 +13,20 @@ async def arbitrage_bot_loop(app):
             await delta.load_markets()
             
             options_symbols = [s for s in delta.symbols if 'BTC' in s and ('C' in s or 'P' in s) and '-' in s]
-            print(f"Total BTC option symbols found: {len(options_symbols)}")
             
-            iv_data = []
-            for symbol in options_symbols[:10]:
-                try:
-                    ticker = await delta.fetch_ticker(symbol)
-                    mark_iv = ticker.get('info', {}).get('mark_iv')
-                    print(f"Checking {symbol} -> Mark IV: {mark_iv}")
-                    if mark_iv is not None:
-                        iv_data.append({'symbol': symbol, 'iv': float(mark_iv), 'bid': ticker.get('bid'), 'ask': ticker.get('ask')})
-                except Exception as ex:
-                    print(f"Error fetching {symbol}: {ex}")
-                    continue
-            
-            if iv_data:
-                iv_data.sort(key=lambda x: x['iv'], reverse=True)
-                highest_iv_option = iv_data[0]
-                lowest_iv_option = iv_data[-1]
-                iv_spread = highest_iv_option['iv'] - lowest_iv_option['iv']
-                print(f"-> SELL High IV: {highest_iv_option['symbol']} (IV: {highest_iv_option['iv']}%)")
-                print(f"-> BUY Low IV: {lowest_iv_option['symbol']} (IV: {lowest_iv_option['iv']}%)")
-                print(f"-> IV Spread: {iv_spread:.2f}%")
-            else:
-                print("No IV data found in the scanned symbols yet.")
+            if options_symbols:
+                # Ek sample option ka poora ticker print karke keys check karte hain
+                sample_symbol = options_symbols[0]
+                print(f"Inspecting full ticker for: {sample_symbol}")
+                ticker = await delta.fetch_ticker(sample_symbol)
+                print(f"Full Ticker Output: {ticker}")
                 
         except Exception as e:
-            print(f"Error in main IV loop: {e}")
+            print(f"Error in debug loop: {e}")
         finally:
             await delta.close()
             
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 async def start_background_task(app):
     app['bot_task'] = asyncio.create_task(arbitrage_bot_loop(app))
