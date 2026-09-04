@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import aiohttp
@@ -6,14 +5,14 @@ from aiohttp import web
 import ccxt.async_support as ccxt
 import hmac
 import hashlib
+from datetime import datetime, timedelta
 
-# Configuration from Environment Variables
 DELTA_KEY = os.getenv("DELTA_API_KEY", "")
 DELTA_SECRET = os.getenv("DELTA_API_SECRET", "")
 CS_KEY = os.getenv("COINSWITCH_API_KEY", "")
 CS_SECRET = os.getenv("COINSWITCH_API_SECRET", "")
 
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.02"))  # 2% spread threshold
+SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.02"))  # 2% spread
 
 
 class CoinSwitchClient:
@@ -46,10 +45,20 @@ class CoinSwitchClient:
         return {"bids": [], "asks": []}
 
 
-async def arbitrage_bot_loop(app):
-    print("[SYSTEM] Starting Delta & CoinSwitch Arbitrage Engine...")
+def get_next_friday_expiry_code():
+    """Calculates upcoming Friday expiry string in YYMMDD format"""
+    today = datetime.utcnow()
+    # Target Friday (weekday 4)
+    days_ahead = (4 - today.weekday() + 7) % 7
+    if days_ahead == 0 and today.hour >= 8:  # 08:00 UTC settlement passed
+        days_ahead = 7
+    target_date = today + timedelta(days=days_ahead)
+    return target_date.strftime("%y%m%d")
 
-    # Exchange instance single initialization
+
+async def arbitrage_bot_loop(app):
+    print("[SYSTEM] Starting Dynamic Strike Cross-Exchange Engine...")
+
     delta = ccxt.delta({
         "apiKey": DELTA_KEY,
         "secret": DELTA_SECRET,
@@ -57,61 +66,75 @@ async def arbitrage_bot_loop(app):
     })
     cs_client = CoinSwitchClient(CS_KEY, CS_SECRET)
 
-    # Active target symbol pair
-    target_delta_symbol = "BTC/USDT:USDT-260904-80000-C"
-    target_cs_symbol = "BTC-260904-80000-C"
-
     try:
+        await delta.load_markets()
+
         async with aiohttp.ClientSession() as cs_session:
             while True:
                 try:
-                    delta_task = delta.fetch_order_book(target_delta_symbol)
-                    cs_task = cs_client.fetch_order_book(cs_session, target_cs_symbol)
+                    # 1. Fetch live BTC spot price to compute dynamic ATM
+                    spot_ticker = await delta.fetch_ticker("BTC/USDT:USDT")
+                    spot_price = spot_ticker.get("last", 80000)
 
-                    delta_book, cs_book = await asyncio.gather(delta_task, cs_task, return_exceptions=True)
+                    # 2. Round to nearest 1000 strike
+                    atm_strike = int(round(spot_price / 1000.0) * 1000)
+                    expiry_code = get_next_friday_expiry_code()
 
-                    if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
-                        print(f"[WARN] Polling issue | Delta: {delta_book} | CS: {cs_book}")
-                        await asyncio.sleep(2)
-                        continue
+                    # Scan ATM and 1 strike above/below for both Call & Put
+                    strikes_to_scan = [atm_strike - 1000, atm_strike, atm_strike + 1000]
 
-                    # Best Ask (Buying) and Best Bid (Selling)
-                    d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
-                    d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
+                    for strike in strikes_to_scan:
+                        for opt_type in ["C", "P"]:
+                            # Dynamic symbol generation
+                            delta_symbol = f"BTC/USDT:USDT-{expiry_code}-{strike}-{opt_type}"
+                            cs_symbol = f"BTC-{expiry_code}-{strike}-{opt_type}"
 
-                    cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
-                    cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
+                            # Fetch order books in parallel
+                            delta_task = delta.fetch_order_book(delta_symbol)
+                            cs_task = cs_client.fetch_order_book(cs_session, cs_symbol)
 
-                    # Route 1: Delta par Buy, CoinSwitch par Sell
-                    if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
-                        spread_1 = (cs_bid - d_ask) / d_ask
-                        if spread_1 >= SPREAD_THRESHOLD:
-                            print(f"\n[OPPORTUNITY] Route 1: Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%")
+                            delta_book, cs_book = await asyncio.gather(delta_task, cs_task, return_exceptions=True)
 
-                    # Route 2: CoinSwitch par Buy, Delta par Sell
-                    if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
-                        spread_2 = (d_bid - cs_ask) / cs_ask
-                        if spread_2 >= SPREAD_THRESHOLD:
-                            print(f"\n[OPPORTUNITY] Route 2: Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%")
+                            if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
+                                continue
+
+                            d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
+                            d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
+
+                            cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
+                            cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
+
+                            # Check Route 1: Buy Delta, Sell CoinSwitch
+                            if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
+                                spread_1 = (cs_bid - d_ask) / d_ask
+                                if spread_1 >= SPREAD_THRESHOLD:
+                                    print(f"\n[SIGNAL] {delta_symbol} | Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%")
+
+                            # Check Route 2: Buy CoinSwitch, Sell Delta
+                            if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
+                                spread_2 = (d_bid - cs_ask) / cs_ask
+                                if spread_2 >= SPREAD_THRESHOLD:
+                                    print(f"\n[SIGNAL] {delta_symbol} | Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%")
+
+                    print(f"\r[SCAN] BTC Spot: {spot_price:.1f} | Dynamic ATM: {atm_strike} | Expiry: {expiry_code}", end="")
 
                 except Exception as e:
-                    print(f"[LOOP ERROR] {e}")
+                    print(f"\n[LOOP ERROR] {e}")
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
     except asyncio.CancelledError:
-        print("[SYSTEM] Task received shutdown signal.")
+        print("\n[SYSTEM] Worker cancelled.")
     finally:
-        # Solves 'Unclosed connector' and CCXT crash
         await delta.close()
-        print("[SYSTEM] Delta session closed successfully.")
+        print("[SYSTEM] Delta session closed.")
 
 
 async def start_background_task(app):
     app['bot_task'] = asyncio.create_task(arbitrage_bot_loop(app))
 
 async def handle(request):
-    return web.Response(text="Delta-CoinSwitch Arbitrage Worker is Active")
+    return web.Response(text="Delta-CoinSwitch Dynamic Arbitrage Worker is Active")
 
 app = web.Application()
 app.router.add_get('/', handle)
@@ -120,3 +143,5 @@ app.on_startup.append(start_background_task)
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     web.run_app(app, host='0.0.0.0', port=port)
+
+
