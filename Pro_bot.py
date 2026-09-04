@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import aiohttp
@@ -12,7 +13,8 @@ DELTA_SECRET = os.getenv("DELTA_API_SECRET", "")
 CS_KEY = os.getenv("COINSWITCH_API_KEY", "")
 CS_SECRET = os.getenv("COINSWITCH_API_SECRET", "")
 
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.02"))  # 2% spread
+SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.02"))  # 2% spread threshold
+
 
 class CoinSwitchClient:
     def __init__(self, key, secret):
@@ -47,6 +49,7 @@ class CoinSwitchClient:
 async def arbitrage_bot_loop(app):
     print("[SYSTEM] Starting Delta & CoinSwitch Arbitrage Engine...")
 
+    # Exchange instance single initialization
     delta = ccxt.delta({
         "apiKey": DELTA_KEY,
         "secret": DELTA_SECRET,
@@ -54,47 +57,54 @@ async def arbitrage_bot_loop(app):
     })
     cs_client = CoinSwitchClient(CS_KEY, CS_SECRET)
 
-    # Monitor targeted strike pair
+    # Active target symbol pair
     target_delta_symbol = "BTC/USDT:USDT-260904-80000-C"
     target_cs_symbol = "BTC-260904-80000-C"
 
-    async with aiohttp.ClientSession() as cs_session:
-        while True:
-            try:
-                # Fetch order books concurrently
-                delta_book_task = delta.fetch_order_book(target_delta_symbol)
-                cs_book_task = cs_client.fetch_order_book(cs_session, target_cs_symbol)
+    try:
+        async with aiohttp.ClientSession() as cs_session:
+            while True:
+                try:
+                    delta_task = delta.fetch_order_book(target_delta_symbol)
+                    cs_task = cs_client.fetch_order_book(cs_session, target_cs_symbol)
 
-                delta_book, cs_book = await asyncio.gather(delta_book_task, cs_book_task, return_exceptions=True)
+                    delta_book, cs_book = await asyncio.gather(delta_task, cs_task, return_exceptions=True)
 
-                if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
-                    await asyncio.sleep(2)
-                    continue
+                    if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
+                        print(f"[WARN] Polling issue | Delta: {delta_book} | CS: {cs_book}")
+                        await asyncio.sleep(2)
+                        continue
 
-                d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
-                d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
+                    # Best Ask (Buying) and Best Bid (Selling)
+                    d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
+                    d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
 
-                cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
-                cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
+                    cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
+                    cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
 
-                # Check Route 1: Buy Delta, Sell CoinSwitch
-                if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
-                    spread_1 = (cs_bid - d_ask) / d_ask
-                    if spread_1 >= SPREAD_THRESHOLD:
-                        print(f"\n[OPPORTUNITY] Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%")
+                    # Route 1: Delta par Buy, CoinSwitch par Sell
+                    if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
+                        spread_1 = (cs_bid - d_ask) / d_ask
+                        if spread_1 >= SPREAD_THRESHOLD:
+                            print(f"\n[OPPORTUNITY] Route 1: Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%")
 
-                # Check Route 2: Buy CoinSwitch, Sell Delta
-                if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
-                    spread_2 = (d_bid - cs_ask) / cs_ask
-                    if spread_2 >= SPREAD_THRESHOLD:
-                        print(f"\n[OPPORTUNITY] Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%")
+                    # Route 2: CoinSwitch par Buy, Delta par Sell
+                    if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
+                        spread_2 = (d_bid - cs_ask) / cs_ask
+                        if spread_2 >= SPREAD_THRESHOLD:
+                            print(f"\n[OPPORTUNITY] Route 2: Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%")
 
-            except Exception as e:
-                print(f"[ERROR] Engine loop error: {e}")
+                except Exception as e:
+                    print(f"[LOOP ERROR] {e}")
 
-            await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
-    await delta.close()
+    except asyncio.CancelledError:
+        print("[SYSTEM] Task received shutdown signal.")
+    finally:
+        # Solves 'Unclosed connector' and CCXT crash
+        await delta.close()
+        print("[SYSTEM] Delta session closed successfully.")
 
 
 async def start_background_task(app):
