@@ -32,7 +32,7 @@ class CoinSwitchClient:
     async def fetch_order_book(self, session, symbol):
         endpoint = f"/v1/derivatives/orderbook?symbol={symbol}"
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/json",z
             "X-AUTH-APIKEY": self.key,
             "X-AUTH-SIGNATURE": self._get_signature("GET", endpoint)
         }
