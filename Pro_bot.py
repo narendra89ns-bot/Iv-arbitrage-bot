@@ -1,70 +1,112 @@
 import os
 import asyncio
+import aiohttp
 from aiohttp import web
 import ccxt.async_support as ccxt
+import hmac
+import hashlib
+
+# Configuration from Environment Variables
+DELTA_KEY = os.getenv("DELTA_API_KEY", "")
+DELTA_SECRET = os.getenv("DELTA_API_SECRET", "")
+CS_KEY = os.getenv("COINSWITCH_API_KEY", "")
+CS_SECRET = os.getenv("COINSWITCH_API_SECRET", "")
+
+SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.02"))  # 2% spread
+
+class CoinSwitchClient:
+    def __init__(self, key, secret):
+        self.base_url = "https://api-trading.coinswitch.co"
+        self.key = key
+        self.secret = secret
+
+    def _get_signature(self, method, endpoint, payload=""):
+        msg = f"{method}{endpoint}{payload}".encode("utf-8")
+        return hmac.new(self.secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+    async def fetch_order_book(self, session, symbol):
+        endpoint = f"/v1/derivatives/orderbook?symbol={symbol}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": self.key,
+            "X-AUTH-SIGNATURE": self._get_signature("GET", endpoint)
+        }
+        try:
+            async with session.get(self.base_url + endpoint, headers=headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "bids": data.get("bids", []),
+                        "asks": data.get("asks", [])
+                    }
+        except Exception:
+            pass
+        return {"bids": [], "asks": []}
+
 
 async def arbitrage_bot_loop(app):
-    while True:
-        delta = ccxt.delta({
-            'enableRateLimit': True,
-        })
-        try:
-            print("Connecting to Delta and loading markets...")
-            await delta.load_markets()
-            
-            options_symbols = [s for s in delta.symbols if 'BTC' in s and ('C' in s or 'P' in s) and '-' in s]
-            
-            iv_data = []
-            for symbol in options_symbols[:15]:
-                try:
-                    ticker = await delta.fetch_ticker(symbol)
-                    # Correct path found from logs: info -> quotes -> mark_iv
-                    info = ticker.get('info', {})
-                    quotes = info.get('quotes', {}) if isinstance(info, dict) else {}
-                    mark_iv = quotes.get('mark_iv')
-                    
-                    if mark_iv is not None:
-                        iv_data.append({
-                            'symbol': symbol, 
-                            'iv': float(mark_iv) * 100, # Percentage me convert karne ke liye agar decimal me ho
-                            'bid': ticker.get('bid'), 
-                            'ask': ticker.get('ask')
-                        })
-                except Exception:
+    print("[SYSTEM] Starting Delta & CoinSwitch Arbitrage Engine...")
+
+    delta = ccxt.delta({
+        "apiKey": DELTA_KEY,
+        "secret": DELTA_SECRET,
+        "enableRateLimit": True,
+    })
+    cs_client = CoinSwitchClient(CS_KEY, CS_SECRET)
+
+    # Monitor targeted strike pair
+    target_delta_symbol = "BTC/USDT:USDT-260904-80000-C"
+    target_cs_symbol = "BTC-260904-80000-C"
+
+    async with aiohttp.ClientSession() as cs_session:
+        while True:
+            try:
+                # Fetch order books concurrently
+                delta_book_task = delta.fetch_order_book(target_delta_symbol)
+                cs_book_task = cs_client.fetch_order_book(cs_session, target_cs_symbol)
+
+                delta_book, cs_book = await asyncio.gather(delta_book_task, cs_book_task, return_exceptions=True)
+
+                if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
+                    await asyncio.sleep(2)
                     continue
-            
-            if iv_data:
-                iv_data.sort(key=lambda x: x['iv'], reverse=True)
-                highest_iv_option = iv_data[0]
-                lowest_iv_option = iv_data[-1]
-                iv_spread = highest_iv_option['iv'] - lowest_iv_option['iv']
-                
-                print(f"-> SELL High IV: {highest_iv_option['symbol']} (IV: {highest_iv_option['iv']:.2f}%)")
-                print(f"-> BUY Low IV: {lowest_iv_option['symbol']} (IV: {lowest_iv_option['iv']:.2f}%)")
-                print(f"-> IV Spread: {iv_spread:.2f}%")
-                
-                if iv_spread > 5.0:
-                    print(f"TEST SIGNAL: Spread threshold met! Executing simulated spread trade.")
-            else:
-                print("No valid IV data captured in this cycle.")
-                
-        except Exception as e:
-            print(f"Error in main IV loop: {e}")
-        finally:
-            await delta.close()
-            
-        await asyncio.sleep(30)
+
+                d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
+                d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
+
+                cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
+                cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
+
+                # Check Route 1: Buy Delta, Sell CoinSwitch
+                if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
+                    spread_1 = (cs_bid - d_ask) / d_ask
+                    if spread_1 >= SPREAD_THRESHOLD:
+                        print(f"\n[OPPORTUNITY] Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%")
+
+                # Check Route 2: Buy CoinSwitch, Sell Delta
+                if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
+                    spread_2 = (d_bid - cs_ask) / cs_ask
+                    if spread_2 >= SPREAD_THRESHOLD:
+                        print(f"\n[OPPORTUNITY] Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%")
+
+            except Exception as e:
+                print(f"[ERROR] Engine loop error: {e}")
+
+            await asyncio.sleep(1)
+
+    await delta.close()
+
 
 async def start_background_task(app):
     app['bot_task'] = asyncio.create_task(arbitrage_bot_loop(app))
 
 async def handle(request):
-    return web.Response(text="IV Arbitrage Test Bot is active and running 24/7!")
+    return web.Response(text="Delta-CoinSwitch Arbitrage Worker is Active")
 
 app = web.Application()
-app.router.add_get("/", handle)
+app.router.add_get('/', handle)
 app.on_startup.append(start_background_task)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
+    web.run_app(app, host='0.0.0.0', port=port)
