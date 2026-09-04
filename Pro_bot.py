@@ -11,7 +11,11 @@ DELTA_KEY = os.getenv("DELTA_API_KEY", "")
 DELTA_SECRET = os.getenv("DELTA_API_SECRET", "")
 CS_KEY = os.getenv("COINSWITCH_API_KEY", "")
 CS_SECRET = os.getenv("COINSWITCH_API_SECRET", "")
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.0"))
+
+# Configurable Risk & Cost Parameters
+SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.005"))  # 0.5% Net Profit Target
+TOTAL_COST_BUFFER = float(os.getenv("COST_BUFFER", "0.0025"))     # 0.25% (Exchange Fees + Slippage)
+TARGET_LOT_SIZE = float(os.getenv("TARGET_LOT_SIZE", "0.05"))     # Target Contract Qty (BTC)
 
 
 class CoinSwitchClient:
@@ -44,6 +48,24 @@ class CoinSwitchClient:
         return {"bids": [], "asks": []}
 
 
+def calculate_vwap_and_depth(orders, required_qty):
+    """Calculates Volume-Weighted Average Price across depth. Returns None if liquidity is thin."""
+    total_qty = 0.0
+    total_cost = 0.0
+    for order in orders:
+        price = float(order[0])
+        qty = float(order[1])
+        fill = min(qty, required_qty - total_qty)
+        total_cost += fill * price
+        total_qty += fill
+        if total_qty >= required_qty:
+            break
+            
+    if total_qty < required_qty:
+        return None  # Insufficient liquidity to fill target lot size
+    return total_cost / total_qty
+
+
 def get_next_friday_expiry_code():
     today = datetime.utcnow()
     days_ahead = (4 - today.weekday() + 7) % 7
@@ -54,7 +76,7 @@ def get_next_friday_expiry_code():
 
 
 async def arbitrage_bot_loop(app):
-    print("[SYSTEM] Starting Dynamic Strike Engine...", flush=True)
+    print("[SYSTEM] Starting Dynamic Strike Engine with Slippage Protection...", flush=True)
 
     delta = ccxt.delta({
         "apiKey": DELTA_KEY,
@@ -92,20 +114,37 @@ async def arbitrage_bot_loop(app):
                             if isinstance(delta_book, Exception) or isinstance(cs_book, Exception):
                                 continue
 
-                            d_bid = delta_book['bids'][0][0] if delta_book.get('bids') else 0
-                            d_ask = delta_book['asks'][0][0] if delta_book.get('asks') else float('inf')
-                            cs_bid = cs_book['bids'][0][0] if cs_book.get('bids') else 0
-                            cs_ask = cs_book['asks'][0][0] if cs_book.get('asks') else float('inf')
+                            # Calculate Slippage-Adjusted Effective Execution Prices
+                            d_vwap_ask = calculate_vwap_and_depth(delta_book.get('asks', []), TARGET_LOT_SIZE)
+                            d_vwap_bid = calculate_vwap_and_depth(delta_book.get('bids', []), TARGET_LOT_SIZE)
+                            cs_vwap_ask = calculate_vwap_and_depth(cs_book.get('asks', []), TARGET_LOT_SIZE)
+                            cs_vwap_bid = calculate_vwap_and_depth(cs_book.get('bids', []), TARGET_LOT_SIZE)
 
-                            if d_ask > 0 and d_ask != float('inf') and cs_bid > 0:
-                                spread_1 = (cs_bid - d_ask) / d_ask
-                                if spread_1 >= SPREAD_THRESHOLD:
-                                    print(f"[SIGNAL] {delta_symbol} | Buy Delta @ {d_ask} | Sell CS @ {cs_bid} | Spread: {spread_1*100:.2f}%", flush=True)
+                            # Route 1: Buy Delta -> Sell CoinSwitch
+                            if d_vwap_ask and cs_vwap_bid:
+                                gross_spread_1 = (cs_vwap_bid - d_vwap_ask) / d_vwap_ask
+                                net_spread_1 = gross_spread_1 - TOTAL_COST_BUFFER
 
-                            if cs_ask > 0 and cs_ask != float('inf') and d_bid > 0:
-                                spread_2 = (d_bid - cs_ask) / cs_ask
-                                if spread_2 >= SPREAD_THRESHOLD:
-                                    print(f"[SIGNAL] {delta_symbol} | Buy CS @ {cs_ask} | Sell Delta @ {d_bid} | Spread: {spread_2*100:.2f}%", flush=True)
+                                if net_spread_1 >= SPREAD_THRESHOLD:
+                                    print(
+                                        f"[NET PROFIT SIGNAL] {delta_symbol} | "
+                                        f"Buy Delta @ {d_vwap_ask:.2f} | Sell CS @ {cs_vwap_bid:.2f} | "
+                                        f"Net: {net_spread_1 * 100:.2f}% (Gross: {gross_spread_1 * 100:.2f}%)",
+                                        flush=True
+                                    )
+
+                            # Route 2: Buy CoinSwitch -> Sell Delta
+                            if cs_vwap_ask and d_vwap_bid:
+                                gross_spread_2 = (d_vwap_bid - cs_vwap_ask) / cs_vwap_ask
+                                net_spread_2 = gross_spread_2 - TOTAL_COST_BUFFER
+
+                                if net_spread_2 >= SPREAD_THRESHOLD:
+                                    print(
+                                        f"[NET PROFIT SIGNAL] {delta_symbol} | "
+                                        f"Buy CS @ {cs_vwap_ask:.2f} | Sell Delta @ {d_vwap_bid:.2f} | "
+                                        f"Net: {net_spread_2 * 100:.2f}% (Gross: {gross_spread_2 * 100:.2f}%)",
+                                        flush=True
+                                    )
 
                 except Exception as e:
                     print(f"[LOOP ERROR] {e}", flush=True)
@@ -123,7 +162,7 @@ async def start_background_task(app):
     app['bot_task'] = asyncio.create_task(arbitrage_bot_loop(app))
 
 async def handle(request):
-    return web.Response(text="Delta-CoinSwitch Dynamic Arbitrage Worker is Active")
+    return web.Response(text="Delta-CoinSwitch Dynamic Arbitrage Worker with Slippage Guard is Active")
 
 app = web.Application()
 app.router.add_get('/', handle)
