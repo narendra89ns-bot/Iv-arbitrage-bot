@@ -13,9 +13,9 @@ DELTA_SECRET = os.getenv("DELTA_API_SECRET", "")
 CS_KEY = os.getenv("COINSWITCH_API_KEY", "")
 CS_SECRET = os.getenv("COINSWITCH_API_SECRET", "")
 
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.005"))  # 0.5% Net Target
-TOTAL_COST_BUFFER = float(os.getenv("COST_BUFFER", "0.0025"))     # Fees + Slippage Buffer
-TARGET_LOT_SIZE = float(os.getenv("TARGET_LOT_SIZE", "0.05"))     # Target BTC contracts
+SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "-1.0"))  
+TOTAL_COST_BUFFER = float(os.getenv("COST_BUFFER", "0.0025"))     
+TARGET_LOT_SIZE = float(os.getenv("TARGET_LOT_SIZE", "0.001"))     
 LIVE_EXECUTION = os.getenv("LIVE_EXECUTION", "False").lower() in ("true", "1")
 
 
@@ -49,15 +49,14 @@ class CoinSwitchClient:
         return {"bids": [], "asks": []}
 
     async def place_order(self, session, symbol, side, price, qty):
-        """Executes derivatives order on CoinSwitch Pro"""
         endpoint = "/v1/derivatives/order"
         payload = json.dumps({
             "symbol": symbol,
-            "side": side.lower(),       # "buy" or "sell"
+            "side": side.lower(),
             "order_type": "limit",
             "price": price,
             "quantity": qty,
-            "time_in_force": "IOC"      # Immediate-or-Cancel
+            "time_in_force": "IOC"
         })
         headers = {
             "Content-Type": "application/json",
@@ -66,33 +65,23 @@ class CoinSwitchClient:
         }
         try:
             async with session.post(self.base_url + endpoint, headers=headers, data=payload, timeout=5) as resp:
-                result = await resp.json()
-                return result
+                return await resp.json()
         except Exception as e:
             return {"error": str(e)}
 
 
 def calculate_vwap_and_depth(orders, required_qty):
-    total_qty = 0.0
-    total_cost = 0.0
-    for order in orders:
-        price = float(order[0])
-        qty = float(order[1])
-        fill = min(qty, required_qty - total_qty)
-        total_cost += fill * price
-        total_qty += fill
-        if total_qty >= required_qty:
-            break
-            
-    if total_qty < required_qty:
+    if not orders:
         return None
-    return total_cost / total_qty
+    try:
+        # Best available level extract karein testing mock ke liye
+        return float(orders[0][0])
+    except Exception:
+        return None
 
 
 def get_daily_expiry_code():
-    """Calculates Daily Expiry (settles daily at 08:00 UTC)"""
     now_utc = datetime.now(timezone.utc)
-    # If past 08:00 UTC, target tomorrow's daily contract
     if now_utc.hour >= 8:
         target_date = now_utc + timedelta(days=1)
     else:
@@ -101,14 +90,12 @@ def get_daily_expiry_code():
 
 
 async def execute_arbitrage(delta, cs_client, cs_session, delta_sym, cs_sym, d_side, cs_side, d_price, cs_price, qty):
-    """Executes trades simultaneously on both exchanges"""
     print(f"\n[EXECUTION TRIGGERED] Delta: {d_side.upper()} @ {d_price} | CS: {cs_side.upper()} @ {cs_price} | Qty: {qty}", flush=True)
 
     if not LIVE_EXECUTION:
-        print("[DRY-RUN] Orders simulated. Set LIVE_EXECUTION=True in Render to send actual orders.", flush=True)
+        print("[DRY-RUN] Orders simulated. Set LIVE_EXECUTION=True in Render to send actual orders.\n", flush=True)
         return
 
-    # Concurrent Execution Tasks
     delta_task = delta.create_order(
         symbol=delta_sym,
         type='limit',
@@ -186,7 +173,7 @@ async def arbitrage_bot_loop(app):
                                         d_price=d_vwap_ask, cs_price=cs_vwap_bid,
                                         qty=TARGET_LOT_SIZE
                                     )
-                                    await asyncio.sleep(5)  # Cooldown after order attempt
+                                    await asyncio.sleep(4)
 
                             # Route 2: Buy CoinSwitch -> Sell Delta
                             if cs_vwap_ask and d_vwap_bid:
@@ -201,7 +188,7 @@ async def arbitrage_bot_loop(app):
                                         d_price=d_vwap_bid, cs_price=cs_vwap_ask,
                                         qty=TARGET_LOT_SIZE
                                     )
-                                    await asyncio.sleep(5)
+                                    await asyncio.sleep(4)
 
                 except Exception as e:
                     print(f"[LOOP ERROR] {e}", flush=True)
